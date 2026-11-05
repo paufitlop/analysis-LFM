@@ -5,6 +5,7 @@ from matplotlib.ticker import MaxNLocator
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
+from scipy.special import erfc
 import pandas as pd
 
 
@@ -22,6 +23,9 @@ def gauss_solo(x, sigma, mu, A):
     """ Gaussian fit"""
     y = A*np.exp(-0.5*(x-mu)**2/sigma**2)
     return y
+
+def compton_edge_fit(E, E_c, s, A, B, C):
+    return A * erfc((E - E_c) / (np.sqrt(2) * s)) + B * np.exp(-(E - E_c)**2 / (2 * s**2)) + C
 
 
 def smooth(y, box_pts):
