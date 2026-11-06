@@ -28,7 +28,7 @@ pip install numpy scipy matplotlib pandas jupyter
 The notebooks expect the data files in a `Data/` folder next to the code. Each file is tab-separated, with an `ASIC` column and one column per channel, `CH[0]` … `CH[15]`. Each row is one event.
 
 ```
-ASIC	CH[0]	CH[1]	...	CH[15]
+TRG_ID	CH[0]	CH[1]	...	CH[15]
 1	2412	2398	...	2405
 ```
 
