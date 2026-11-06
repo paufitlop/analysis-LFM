@@ -1,11 +1,11 @@
 import numpy as np
+import os
 from matplotlib.lines import Line2D
 from matplotlib.legend_handler import HandlerTuple
 from matplotlib.ticker import MaxNLocator
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
-from scipy.special import erfc
 import pandas as pd
 
 
@@ -23,9 +23,6 @@ def gauss_solo(x, sigma, mu, A):
     """ Gaussian fit"""
     y = A*np.exp(-0.5*(x-mu)**2/sigma**2)
     return y
-
-def compton_edge_fit(E, E_c, s, A, B, C):
-    return A * erfc((E - E_c) / (np.sqrt(2) * s)) + B * np.exp(-(E - E_c)**2 / (2 * s**2)) + C
 
 
 def smooth(y, box_pts):
@@ -763,3 +760,265 @@ def energy_eff(area, delta_area, activity, delta_activity, time, delta_time, bra
     )
 
     return abs_eff, delta_abs_eff, int_eff, delta_int_eff
+
+
+
+
+
+def area_photopeak(bin_centers, counts, xl, xr, to_x=lambda x: x):
+    """ Calculates net photopeak area """
+
+    mask = (bin_centers >= xl) & (bin_centers <= xr)
+    x_peak = bin_centers[mask]
+    y_peak = counts[mask]
+
+    if len(x_peak) < 2:
+        return 0, 0
+
+    x_l, x_r = x_peak[0], x_peak[-1]
+    y_l, y_r = y_peak[0], y_peak[-1]
+
+    m = (y_r - y_l) / (x_r - x_l)
+    c = y_l - m * x_l
+    baseline = m * x_peak + c
+
+    net_heights = y_peak - baseline
+    net_area_counts = np.sum(net_heights)
+
+    bin_width = x_peak[1] - x_peak[0]
+    continuum_area = (0.5 * m * (x_r**2 - x_l**2) + c * (x_r - x_l)) / bin_width
+    raw_area = np.trapezoid(y_peak, x_peak) / bin_width
+
+    error_net_area = np.sqrt(continuum_area + raw_area)
+
+    xp = to_x(x_peak)
+    plt.fill_between(xp, baseline, y_peak, color='orange', alpha=0.4,
+                     label=f'Net area: {net_area_counts:.1f} counts')
+    plt.plot(xp, baseline, color='red', linestyle='--', linewidth=2,
+             label='Continuum (linear interp.)')
+    plt.scatter(to_x(np.array([x_l, x_r])), [y_l, y_r], color='red', marker='s',
+                s=90, zorder=10, label='Reference points')
+
+    return net_area_counts, error_net_area
+
+
+def save_pdf(fig, filename):
+    """ Save the figure as a pdf """
+    root, _ = os.path.splitext(filename)
+    fig.savefig(root + '.pdf', format='pdf', bbox_inches='tight', pad_inches=0.02)
+
+
+def fit_gaussiana_and_area(
+    ruta,
+    asicid,
+    smoothing_points,
+    xl,
+    xr,
+    prominence_peak,
+    fit_bool,
+    subtract_bool,
+    background_removal,
+    pos_pedestal=None,
+    ruta_bg=None,
+    tbg=1,
+    tsrc=1,
+    num_canals=16,
+    num_bins=1200,
+    fit_type="gauss",
+    calc_area_bool=True,
+    area_xl=4170,
+    area_xr=4650,
+    plot_label="",
+    save_fig_bool=False,
+    output_filename="areaNa_fit.pdf",
+    calib=None,
+    plot_xlim=None,
+    plot_ylim=None,
+    label_pos_x=1,
+    label_pos_y=1,
+):
+    """ Gaussian fit and photopeak net area calculation  """
+
+
+    fwhm_factor = 2 * np.sqrt(2 * np.log(2))
+
+    # Plots ADC channel if no calibration parameters is provided or plots E
+    if calib is not None:
+        def to_x(ch):
+            return np.polyval(calib, ch)
+        dcalib = np.polyder(np.asarray(calib, dtype=float))
+        xlabel = r'$E$ (keV)'
+    else:
+        def to_x(ch):
+            return ch
+        xlabel = 'ADC channel'
+    ylabel = 'Counts'
+
+    # Load Data
+    dades = np.array(cargar_canales_separados(ruta, asicid))
+
+    if subtract_bool:
+        dades_corregides = dades - pos_pedestal.reshape(num_canals, 1)
+        vector_total = np.sum(dades_corregides, axis=0)
+    else:
+        vector_total = np.sum(dades, axis=0)
+
+    # Compute Histogram
+    counts, bin_edges = np.histogram(vector_total, bins=num_bins)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    x_plot = to_x(bin_centers)
+
+    # Normalised background removal
+    if background_removal and subtract_bool:
+        dades_bg = np.array(cargar_canales_separados(ruta_bg, asicid))
+        dades_corregides_bg = dades_bg - pos_pedestal.reshape(num_canals, 1)
+        vector_total_bg = np.sum(dades_corregides_bg, axis=0)
+
+        counts_bg, _ = np.histogram(
+            vector_total_bg,
+            bins=num_bins,
+            range=(vector_total.min(), vector_total.max()),
+        )
+
+        counts_bg_time = counts_bg * (tsrc / tbg)
+        counts_total = counts - counts_bg_time
+    else:
+        counts_total = counts
+
+    # Smooth spectrum
+    smooth_y = smooth(counts_total, smoothing_points)
+
+    magnituds = None
+    delta_magnituds = None
+    net_area, error_net_area = None, None
+
+    # Gaussian fit
+    if fit_bool == True:
+        mask = (bin_centers > xl) & (bin_centers < xr)
+        y_peak = smooth_y[mask]
+        x_peak = bin_centers[mask]
+
+        peak, _ = find_peaks(y_peak, prominence=prominence_peak)
+        if len(peak) == 0:
+            raise RuntimeError(f"No s'ha detectat cap pic a la finestra [{xl}, {xr}].")
+
+        alcades = np.array([y_peak[i] for i in peak])
+        idx_max = np.argmax(alcades)
+        max_height = alcades[idx_max]
+        x_pic = x_peak[peak[idx_max]].item()
+
+        amp_guess = np.max(y_peak)
+        mu_guess = x_pic
+        sigma_guess = 20
+
+        if fit_type == "gauss":
+            fit_func = gauss
+            p0 = [sigma_guess, mu_guess, amp_guess, 0, 0]
+        elif fit_type == "gauss_parab":
+            fit_func = gauss_parab
+            p0 = [sigma_guess, mu_guess, amp_guess, 0, 0, 0]
+        else:
+            raise ValueError(f"Model '{fit_type}' no vàlid. Utilitza 'gauss' o 'gauss_parab'.")
+
+        fit_1, cov = curve_fit(fit_func, x_peak, y_peak, p0)
+
+        # Parameter Calculations (in ADC channels)
+        amp, delta_amp = fit_1[2], np.sqrt(cov[2][2])
+        mu, delta_mu = fit_1[1], np.sqrt(cov[1][1])
+        sigma, delta_sigma = np.abs(fit_1[0]), np.sqrt(cov[0][0])
+
+        fwhm = fwhm_factor * sigma
+        delta_fwhm = fwhm_factor * delta_sigma
+
+        bin_width = bin_edges[1] - bin_edges[0]
+        area_gauss = sigma * amp * np.sqrt(2 * np.pi) / bin_width
+        delta_area_gauss = (
+            np.sqrt(2 * np.pi)
+            * np.sqrt(sigma**2 * delta_amp**2 + amp**2 * delta_sigma**2)
+            / bin_width
+        )
+
+        resol = 100 * fwhm / mu
+        delta_resol = 100 * np.sqrt(delta_fwhm**2 / mu**2 + fwhm**2 / mu**4 * delta_mu**2)
+
+        print(f"--- Fit ({fit_type}) ---")
+        print(f"mu = {mu:.3f} ± {delta_mu:.3f} ch")
+        print(f"sigma = {sigma:.3f} ± {delta_sigma:.3f} ch")
+        print(f"R (%) [canals] = {resol:.2f} ± {delta_resol:.2f}")
+        print(f"area (gauss) = {area_gauss:.2f} ± {delta_area_gauss:.2f}")
+
+        # Same quantities in energy (calibration uncertainty not included)
+        if calib is not None:
+            slope = abs(np.polyval(dcalib, mu))
+            mu_E, delta_mu_E = to_x(mu), slope * delta_mu
+            fwhm_E, delta_fwhm_E = slope * fwhm, slope * delta_fwhm
+            resol_E = 100 * fwhm_E / mu_E
+            delta_resol_E = 100 * np.sqrt(delta_fwhm_E**2 / mu_E**2
+                                          + fwhm_E**2 / mu_E**4 * delta_mu_E**2)
+            print(f"E(mu) = {mu_E:.2f} ± {delta_mu_E:.2f} keV")
+            print(f"FWHM = {fwhm_E:.2f} ± {delta_fwhm_E:.2f} keV")
+            print(f"R (%) [energy] = {resol_E:.2f} ± {delta_resol_E:.2f}")
+
+        # Zoom plot
+        fig, ax = plt.subplots(figsize=(15, 8))
+
+        if calc_area_bool:
+            net_area, error_net_area = area_photopeak(bin_centers, counts_total,
+                                                      area_xl, area_xr, to_x=to_x)
+            print("--- Linear Subtraction Calculation ---")
+            print(f"Net Peak Area = {net_area:.2f} ± {error_net_area:.2f} counts\n")
+
+        x_gauss = np.linspace(xl, xr, 300)
+        y_gauss = fit_func(x_gauss, *fit_1)
+
+        ax.scatter(to_x(mu), fit_func(mu, *fit_1), color="purple", s=100, zorder=4,
+                   label="Centroid (Gaussian)")
+        ax.scatter(x_plot[mask], counts_total[mask], color="#051282", s=80, zorder=5,
+                   label="Fitting points")
+        ax.plot(x_plot, counts_total, color="#FF570A", label="Net spectrum")
+        ax.plot(to_x(x_gauss), y_gauss, linewidth=4, color="green",
+                label="Gaussian fit")
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(plot_xlim if plot_xlim is not None else (to_x(xl), to_x(xr)))
+        ax.set_ylim(plot_ylim if plot_ylim is not None else (0, 1.15 * max_height))
+        ax.legend(loc="upper right")
+
+        if plot_label:
+            ax.text(label_pos_x, label_pos_y, plot_label, transform=ax.transAxes,
+                    va="top", ha="left", fontsize=25)
+
+        if save_fig_bool:
+            save_pdf(fig, output_filename)
+
+        plt.show()
+
+        magnituds = [mu, sigma, amp, fwhm, area_gauss, net_area]
+        delta_magnituds = [delta_mu, delta_sigma, delta_amp, delta_fwhm, delta_area_gauss, error_net_area]
+
+    # No Fit
+    else:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.plot(x_plot, counts_total, color='black', linewidth=1)
+        ax.axvline(x=to_x(xl), color='red')
+        ax.axvline(x=to_x(xr), color='red')
+        ax.set_yscale('log')
+        ax.set_ylim(bottom=1)
+        if plot_xlim is not None:
+            ax.set_xlim(plot_xlim)
+        else:
+            ax.set_xlim(left=to_x(-200))
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+
+        if plot_label:
+            ax.text(label_pos_x, label_pos_y, plot_label, transform=ax.transAxes,
+                    va="top", ha="left", fontsize=20, fontweight='bold')
+
+        if save_fig_bool:
+            save_pdf(fig, output_filename)
+
+        plt.show()
+
+    return bin_centers, counts_total, net_area, error_net_area, magnituds, delta_magnituds
